@@ -69,7 +69,9 @@ REGISTER_OBSERVATION(motion_anchor_ori_b)
     auto ref_quat_w  = motion_anchor_quat_w(loader);
 
     auto rot_ = (init_quat * ref_quat_w).conjugate() * real_quat_w;
-    auto rot = rot_.toRotationMatrix().transpose();
+    // Not `auto`: .transpose() is a lazy view of the temporary returned by toRotationMatrix(), which dies at the
+    // end of the statement; reading it afterwards is undefined behaviour (garbage obs on some builds).
+    Eigen::Matrix3f rot = rot_.toRotationMatrix().transpose();
 
     Eigen::Matrix<float, 6, 1> data;
     data << rot(0, 0), rot(0, 1), rot(1, 0), rot(1, 1), rot(2, 0), rot(2, 1);
