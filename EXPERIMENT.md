@@ -73,6 +73,14 @@ Sequence on the robot: hanging, L2+R2 (debug mode); `./g1_ctrl --network=eth0`; 
 feet carry weight; R2+A (Velocity, shipped velocity/v0); R1+Y (Mimic). Entry aligns the clip's yaw to the robot, not
 its position. At the clip end it returns to Velocity. L2+B is Passive; there is no automatic fall detection.
 
+## Files of the LAFAN 0-12 s run
+- `src/assets/motions/g1/`: `walk1_subject1.csv` (as downloaded), `walk1_subject1_0-12s.csv` (the cut clip, from
+  `head -n 361 walk1_subject1.csv`) and `lafan_walk1_subject1_0-12s.npz` (its csv_to_npz output, 600 frames).
+- `results/lafan_walk1_subject1_0-12s/`: `model_30000.pt` (final), `policy.onnx`, the TensorBoard events file (one run
+  dir, no resume), `params/{env,agent}.yaml` from train.py with env.yaml's absolute `motion_file` made repo-relative.
+- `deploy/robots/g1/config/policy/mimic/lafan_walk1_0_12s/`: package of model_30000, regenerated with
+  make_deploy_package.py; identical to the one run on the robot except for the recorded checkpoint path.
+
 ## Results
 Three runs, one seed (42) each, public config, 4096 envs, 24 steps per env per iteration, one Titan RTX per run
 (2.0 to 2.6 s per iteration).
