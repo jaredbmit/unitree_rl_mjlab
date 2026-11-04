@@ -1,0 +1,94 @@
+"""Package a tracking checkpoint for the C++ deployer (deploy/robots/g1, State_Mimic).
+
+Writes <out_dir>/exported/policy.onnx (+ <name>_motion.onnx with bundled motion and metadata),
+<out_dir>/params/deploy.yaml and <out_dir>/params/<motion>.npz, i.e. the layout of the shipped
+config/policy/mimic/dance1_subject2/. deploy.yaml = the shipped mimic deploy.yaml with stiffness, damping,
+default_joint_pos and action scale/offset replaced by the values of the training env (the ONNX metadata).
+
+Run from the repo root (CPU is fine, ~2 min of warp kernel compiles):
+  .venv/bin/python scripts/make_deploy_package.py <model_N.pt | run name> <motion.npz> \
+    deploy/robots/g1/config/policy/mimic/<state> [--device cpu]
+A run name selects the newest model_*.pt of logs/rsl_rl/g1_tracking/*_<run name>/ (all resumed dirs).
+"""
+import argparse
+import os
+import shutil
+import sys
+from dataclasses import asdict
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO))  # import src.tasks from this checkout
+
+import mjlab.tasks  # noqa: E402, F401  (registry)
+import src.tasks  # noqa: E402, F401
+import yaml  # noqa: E402
+from mjlab.envs import ManagerBasedRlEnv  # noqa: E402
+from mjlab.rl import RslRlVecEnvWrapper  # noqa: E402
+from mjlab.rl.exporter_utils import attach_metadata_to_onnx, get_base_metadata  # noqa: E402
+from mjlab.tasks.registry import load_env_cfg, load_rl_cfg, load_runner_cls  # noqa: E402
+
+TASK = "Unitree-G1-Tracking-No-State-Estimation"
+TEMPLATE = REPO / "deploy/robots/g1/config/policy/mimic/dance1_subject2/params/deploy.yaml"
+# training observation term -> deployer observation name (deploy/robots/g1/src/State_Mimic.cpp, deploy/include/isaaclab)
+OBS_MAP = {"command": "motion_command", "motion_anchor_ori_b": "motion_anchor_ori_b", "base_ang_vel": "base_ang_vel",
+           "joint_pos": "joint_pos_rel", "joint_vel": "joint_vel_rel", "actions": "last_action"}
+SDK = ["left_hip_pitch", "left_hip_roll", "left_hip_yaw", "left_knee", "left_ankle_pitch", "left_ankle_roll",
+       "right_hip_pitch", "right_hip_roll", "right_hip_yaw", "right_knee", "right_ankle_pitch", "right_ankle_roll",
+       "waist_yaw", "waist_roll", "waist_pitch", "left_shoulder_pitch", "left_shoulder_roll", "left_shoulder_yaw",
+       "left_elbow", "left_wrist_roll", "left_wrist_pitch", "left_wrist_yaw", "right_shoulder_pitch",
+       "right_shoulder_roll", "right_shoulder_yaw", "right_elbow", "right_wrist_roll", "right_wrist_pitch",
+       "right_wrist_yaw"]
+
+ap = argparse.ArgumentParser()
+ap.add_argument("checkpoint", help="model_N.pt, or a run name")
+ap.add_argument("motion")
+ap.add_argument("out_dir")
+ap.add_argument("--log-root", default="logs/rsl_rl/g1_tracking")
+ap.add_argument("--device", default="cpu")
+a = ap.parse_args()
+ckpt = Path(a.checkpoint)
+if ckpt.suffix != ".pt":
+  ckpts = list(Path(a.log_root).glob(f"*_{a.checkpoint}/model_*.pt"))
+  assert ckpts, f"no model_*.pt under {a.log_root}/*_{a.checkpoint}/"
+  ckpt = max(ckpts, key=lambda p: int(p.stem.split("_")[1]))
+ckpt_name = os.path.relpath(ckpt)  # recorded in deploy.yaml and the ONNX metadata
+out = Path(a.out_dir)
+(out / "exported").mkdir(parents=True, exist_ok=True)
+(out / "params").mkdir(parents=True, exist_ok=True)
+
+env_cfg = load_env_cfg(TASK, play=True)
+env_cfg.scene.num_envs = 1
+env_cfg.commands["motion"].motion_file = str(Path(a.motion).resolve())
+env = RslRlVecEnvWrapper(ManagerBasedRlEnv(cfg=env_cfg, device=a.device))
+agent_cfg = load_rl_cfg(TASK)
+runner = load_runner_cls(TASK)(env, asdict(agent_cfg), device=a.device)
+runner.load(str(ckpt), load_cfg={"actor": True}, strict=True, map_location=a.device)
+
+runner.export_policy_to_onnx(str(out / "exported"), "policy.onnx")
+runner.export_motion_policy_to_onnx(str(out / "exported"), f"{out.name}_motion.onnx")
+meta = get_base_metadata(env.unwrapped, f"local:{ckpt_name}")
+term = env.unwrapped.command_manager.get_term("motion")
+meta.update({"anchor_body_name": term.cfg.anchor_body_name, "body_names": list(term.cfg.body_names)})
+attach_metadata_to_onnx(str(out / "exported" / f"{out.name}_motion.onnx"), meta)
+
+assert list(meta["observation_names"]) == list(OBS_MAP), meta["observation_names"]
+assert list(meta["joint_names"]) == [s + "_joint" for s in SDK], meta["joint_names"]
+cfg = yaml.safe_load(TEMPLATE.read_text())
+assert list(cfg["observations"]) == list(OBS_MAP.values()), list(cfg["observations"])
+r = lambda v: [round(float(x), 4) for x in v]  # noqa: E731
+cfg["step_dt"] = float(env.unwrapped.step_dt)
+cfg["joint_ids_map"] = list(range(len(meta["joint_names"])))  # mjlab joint order == SDK motor order (asserted above)
+cfg["stiffness"], cfg["damping"] = r(meta["joint_stiffness"]), r(meta["joint_damping"])
+cfg["default_joint_pos"] = r(meta["default_joint_pos"])
+cfg["actions"]["JointPositionAction"]["scale"] = r(meta["action_scale"])
+cfg["actions"]["JointPositionAction"]["offset"] = r(meta["default_joint_pos"])
+(out / "params" / "deploy.yaml").write_text(
+  f"# generated by make_deploy_package.py from {ckpt_name}\n"
+  + yaml.safe_dump(cfg, default_flow_style=None, sort_keys=False, width=200))
+motion = out / "params" / Path(a.motion).name
+shutil.copy(a.motion, motion)
+print(f"wrote {out}: exported/policy.onnx, exported/{out.name}_motion.onnx, params/deploy.yaml, params/{motion.name}")
+root = out.resolve().parents[3]  # deploy/robots/g1: the deployer resolves config paths from here
+print(f"config.yaml state entry: motion_file: {motion.resolve().relative_to(root)}  "
+      f"policy_dir: {out.resolve().relative_to(root)}/")
